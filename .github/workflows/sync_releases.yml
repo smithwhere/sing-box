@@ -110,9 +110,9 @@ jobs:
           secure: true
           username: 317718961@qq.com
           password: ${{ secrets.QQ_SMTP_AUTH_CODE }}
-          subject: Hysteria Releases 同步完成
+          subject: ${{ github.event.repository.name }} Releases 同步完成
           to: any@phone.eu.org
           from: 317718961@qq.com
           body: |
-            Hysteria Releases 同步已完成。
+            ${{ github.event.repository.name }} Releases 同步已完成。
             本次同步版本：${{ steps.sync.outputs.summary }}
