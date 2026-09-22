@@ -15,14 +15,31 @@ jobs:
         with:
           github-token: ${{ secrets.SYNC_TOKEN }}
           script: |
-            const fs = require('fs');
-            const path = require('path');
-
-            // 原仓库与你自己的仓库配置
             const upstreamOwner = "SagerNet";
             const upstreamRepo = "sing-box";
             const myOwner = context.repo.owner;
             const myRepo = context.repo.repo;
+            const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+            // GitHub asset endpoints can return transient 5xx responses, including
+            // malformed/empty JSON bodies. Retry those and rate-limit responses.
+            async function withRetry(label, operation, attempts = 6) {
+              for (let attempt = 1; ; attempt++) {
+                try {
+                  return await operation();
+                } catch (error) {
+                  const status = error.status || error.response?.status;
+                  const retryable = status === 429 || [500, 502, 503, 504].includes(status);
+                  if (!retryable || attempt >= attempts) {
+                    throw new Error(`${label} failed after ${attempt} attempt(s): ${error.message}`);
+                  }
+                  const retryAfter = Number(error.response?.headers?.["retry-after"] || 0) * 1000;
+                  const delay = Math.max(retryAfter, Math.min(60000, 2000 * (2 ** (attempt - 1))));
+                  console.log(`[重试 ${attempt}/${attempts - 1}] ${label}: HTTP ${status || "unknown"}，等待 ${Math.ceil(delay / 1000)} 秒`);
+                  await sleep(delay);
+                }
+              }
+            }
 
             console.log("正在通过 GitHub API 获取原仓库的最新 Releases...");
             const upstreamReleases = await github.rest.repos.listReleases({
@@ -35,71 +52,106 @@ jobs:
             const myReleases = await github.rest.repos.listReleases({
               owner: myOwner,
               repo: myRepo,
-              per_page: 50
+              per_page: 100
             });
-            const myTagNames = myReleases.data.map(r => r.tag_name);
+            const myReleaseByTag = new Map(myReleases.data.map(release => [release.tag_name, release]));
             const syncedTags = [];
 
-            // 倒序遍历，确保老版本先同步
+            // Older versions first. Continue partially-created releases instead of
+            // treating the presence of a tag as proof that every asset was copied.
             for (const release of upstreamReleases.data.reverse()) {
-              if (myTagNames.includes(release.tag_name)) {
-                console.log(`[跳过] 版本 ${release.tag_name} 在你的仓库中已存在。`);
-                continue;
+              let targetRelease = myReleaseByTag.get(release.tag_name);
+              if (!targetRelease) {
+                console.log(`[开始搬运] 创建版本 ${release.tag_name}...`);
+                const created = await withRetry(`创建 Release ${release.tag_name}`, () =>
+                  github.rest.repos.createRelease({
+                    owner: myOwner,
+                    repo: myRepo,
+                    tag_name: release.tag_name,
+                    name: release.name || release.tag_name,
+                    body: release.body || "自动同步自上游仓库更新日志。",
+                    draft: false,
+                    prerelease: release.prerelease
+                  })
+                );
+                targetRelease = created.data;
+                myReleaseByTag.set(release.tag_name, targetRelease);
+              } else {
+                console.log(`[续传] 继续检查版本 ${release.tag_name} 的附件...`);
               }
 
-              console.log(`[开始搬运] 发现新版本 ${release.tag_name}，正在为你创建对应的 Release 页面...`);
-
-              // 核心修复：直接通过 API 在你的仓库创建 Release。
-              // 关键：GitHub API 允许在创建 Release 的同时自动在底层建立对应的 Tag，不需要通过 git push 触发！
-              const newRelease = await github.rest.repos.createRelease({
-                owner: myOwner,
-                repo: myRepo,
-                tag_name: release.tag_name,
-                name: release.name || release.tag_name,
-                body: release.body || "自动同步自上游仓库更新日志。",
-                draft: false,
-                prerelease: release.prerelease
-              });
-
-              console.log(`Release 页面创建成功！开始下载并中转该版本的附件资产...`);
+              const existingAssets = await github.paginate(
+                github.rest.repos.listReleaseAssets,
+                { owner: myOwner, repo: myRepo, release_id: targetRelease.id, per_page: 100 }
+              );
+              const existingNames = new Set(existingAssets.map(asset => asset.name));
+              let complete = true;
 
               for (const asset of release.assets) {
-                console.log(`  -> 正在处理文件: ${asset.name}`);
-                
-                // 1. 从原仓库下载附件
-                const assetData = await github.rest.repos.getReleaseAsset({
-                  owner: upstreamOwner,
-                  repo: upstreamRepo,
-                  asset_id: asset.id,
-                  headers: { accept: 'application/octet-stream' }
-                });
+                if (existingNames.has(asset.name)) {
+                  console.log(`[跳过] ${asset.name} 已存在。`);
+                  continue;
+                }
 
-                const filePath = path.join(process.cwd(), asset.name);
-                fs.writeFileSync(filePath, Buffer.from(assetData.data));
+                console.log(`[下载] ${asset.name}`);
+                const assetData = await withRetry(`下载 ${asset.name}`, () =>
+                  github.rest.repos.getReleaseAsset({
+                    owner: upstreamOwner,
+                    repo: upstreamRepo,
+                    asset_id: asset.id,
+                    headers: { accept: "application/octet-stream" }
+                  })
+                );
+                const fileBuffer = Buffer.from(assetData.data);
 
-                // 2. 将附件上传到你的新 Release 中
-                const fileBuffer = fs.readFileSync(filePath);
-                await github.rest.repos.uploadReleaseAsset({
-                  owner: myOwner,
-                  repo: myRepo,
-                  release_id: newRelease.data.id,
-                  name: asset.name,
-                  data: fileBuffer,
-                  headers: {
-                    'content-type': asset.content_type,
-                    'content-length': fileBuffer.length
-                  }
-                });
+                try {
+                  await withRetry(`上传 ${asset.name}`, () =>
+                    github.rest.repos.uploadReleaseAsset({
+                      owner: myOwner,
+                      repo: myRepo,
+                      release_id: targetRelease.id,
+                      name: asset.name,
+                      data: fileBuffer,
+                      headers: {
+                        "content-type": asset.content_type || "application/octet-stream",
+                        "content-length": fileBuffer.length
+                      }
+                    })
+                  );
+                } catch (error) {
+                  // A timed-out upload may have reached GitHub. Confirm before
+                  // failing so a later run can safely resume without duplicates.
+                  const refreshed = await github.paginate(
+                    github.rest.repos.listReleaseAssets,
+                    { owner: myOwner, repo: myRepo, release_id: targetRelease.id, per_page: 100 }
+                  );
+                  if (!refreshed.some(item => item.name === asset.name)) throw error;
+                }
 
-                console.log(`  -> 附件 ${asset.name} 上传圆满完成！`);
-                fs.unlinkSync(filePath); // 清理临时空间
+                existingNames.add(asset.name);
+                console.log(`[完成] ${asset.name}`);
               }
-              console.log(`[大成功] 版本 ${release.tag_name} 及其所有附件全部搬运完毕！`);
-              syncedTags.push(release.tag_name);
+
+              // Confirm completeness against GitHub's current asset listing.
+              const finalAssets = await github.paginate(
+                github.rest.repos.listReleaseAssets,
+                { owner: myOwner, repo: myRepo, release_id: targetRelease.id, per_page: 100 }
+              );
+              const finalNames = new Set(finalAssets.map(asset => asset.name));
+              const missing = release.assets.filter(asset => !finalNames.has(asset.name)).map(asset => asset.name);
+              if (missing.length) {
+                complete = false;
+                throw new Error(`版本 ${release.tag_name} 尚有 ${missing.length} 个附件未同步：${missing.slice(0, 10).join(", ")}`);
+              }
+
+              if (complete) {
+                console.log(`[完成] ${release.tag_name} 的 ${release.assets.length} 个附件均已同步。`);
+                syncedTags.push(release.tag_name);
+              }
             }
 
-            core.setOutput('synced', String(syncedTags.length > 0));
-            core.setOutput('summary', syncedTags.join(', '));
+            core.setOutput("synced", String(syncedTags.length > 0));
+            core.setOutput("summary", syncedTags.join(", "));
 
       - name: Send sync notification email
         if: steps.sync.outputs.synced == 'true'
