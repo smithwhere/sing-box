@@ -82,51 +82,50 @@ jobs:
 
             // Oldest first, so release order remains chronological.
             for (const release of upstreamReleases.data.reverse()) {
-              const targetRelease = myReleaseByTag.get(release.tag_name);
+              let targetRelease = myReleaseByTag.get(release.tag_name);
+              let createdNow = false;
 
-              if (targetRelease) {
-                const existingAssets = await github.paginate(
-                  github.rest.repos.listReleaseAssets,
-                  { owner: myOwner, repo: myRepo, release_id: targetRelease.id, per_page: 100 }
-                );
-                const existingNames = new Set(existingAssets.map(asset => asset.name));
-                const missing = release.assets.filter(asset => !existingNames.has(asset.name));
-
-                if (missing.length) {
-                  throw new Error(
-                    `版本 ${release.tag_name} 已存在但不完整（缺少 ${missing.length}/${release.assets.length} 个附件）。` +
-                    `本工作流不续传；请先手动删除该 Release，再重新运行。缺失示例：${missing.slice(0, 5).map(a => a.name).join(", ")}`
-                  );
-                }
-
-                console.log(`[跳过] ${release.tag_name} 已存在且完整（${release.assets.length} 个附件）；不续传。`);
-                continue;
+              if (!targetRelease) {
+                console.log(`[开始] 创建草稿 Release ${release.tag_name}（${release.assets.length} 个附件）...`);
+                const created = await github.rest.repos.createRelease({
+                  owner: myOwner,
+                  repo: myRepo,
+                  tag_name: release.tag_name,
+                  target_commitish: targetBranch,
+                  name: release.name || release.tag_name,
+                  body: release.body || "自动同步自上游仓库更新日志。",
+                  draft: true,
+                  prerelease: release.prerelease
+                });
+                targetRelease = created.data;
+                myReleaseByTag.set(release.tag_name, targetRelease);
+                createdNow = true;
+              } else {
+                console.log(`[续传] 检查并补齐 ${release.tag_name} 的缺失附件...`);
               }
 
-              console.log(`[开始] 全新同步 ${release.tag_name}（${release.assets.length} 个附件）...`);
-              const created = await github.rest.repos.createRelease({
-                owner: myOwner,
-                repo: myRepo,
-                tag_name: release.tag_name,
-                target_commitish: targetBranch,
-                name: release.name || release.tag_name,
-                body: release.body || "自动同步自上游仓库更新日志。",
-                draft: true,
-                prerelease: release.prerelease
-              });
-              const targetId = created.data.id;
+              const existingAssets = await github.paginate(
+                github.rest.repos.listReleaseAssets,
+                { owner: myOwner, repo: myRepo, release_id: targetRelease.id, per_page: 100 }
+              );
+              const existingNames = new Set(existingAssets.map(asset => asset.name));
 
-              try {
-                for (const asset of release.assets) {
-                  console.log(`[下载] ${asset.name}`);
-                  const assetData = await downloadWithRetry(asset);
-                  const fileBuffer = Buffer.from(assetData.data);
+              for (const asset of release.assets) {
+                if (existingNames.has(asset.name)) {
+                  console.log(`[跳过] ${asset.name} 已上传。`);
+                  continue;
+                }
 
-                  console.log(`[上传] ${asset.name}（${fileBuffer.length} bytes）`);
+                console.log(`[下载] ${asset.name}`);
+                const assetData = await downloadWithRetry(asset);
+                const fileBuffer = Buffer.from(assetData.data);
+
+                console.log(`[上传] ${asset.name}（${fileBuffer.length} bytes）`);
+                try {
                   await github.rest.repos.uploadReleaseAsset({
                     owner: myOwner,
                     repo: myRepo,
-                    release_id: targetId,
+                    release_id: targetRelease.id,
                     name: asset.name,
                     data: fileBuffer,
                     headers: {
@@ -134,44 +133,46 @@ jobs:
                       "content-length": fileBuffer.length
                     }
                   });
-                  console.log(`[完成] ${asset.name}`);
-                }
-
-                const uploadedAssets = await github.paginate(
-                  github.rest.repos.listReleaseAssets,
-                  { owner: myOwner, repo: myRepo, release_id: targetId, per_page: 100 }
-                );
-                const uploadedNames = new Set(uploadedAssets.map(asset => asset.name));
-                const missing = release.assets.filter(asset => !uploadedNames.has(asset.name));
-                if (missing.length) {
-                  throw new Error(
-                    `校验失败：${release.tag_name} 仍缺少 ${missing.length} 个附件：${missing.slice(0, 5).map(a => a.name).join(", ")}`
+                } catch (error) {
+                  // An upload response may be lost even when GitHub stored the asset.
+                  const refreshedAssets = await github.paginate(
+                    github.rest.repos.listReleaseAssets,
+                    { owner: myOwner, repo: myRepo, release_id: targetRelease.id, per_page: 100 }
                   );
+                  if (!refreshedAssets.some(item => item.name === asset.name)) throw error;
                 }
 
-                // Publish only after every asset has been uploaded and verified.
+                existingNames.add(asset.name);
+                console.log(`[完成] ${asset.name}`);
+              }
+
+              const uploadedAssets = await github.paginate(
+                github.rest.repos.listReleaseAssets,
+                { owner: myOwner, repo: myRepo, release_id: targetRelease.id, per_page: 100 }
+              );
+              const uploadedNames = new Set(uploadedAssets.map(asset => asset.name));
+              const missing = release.assets.filter(asset => !uploadedNames.has(asset.name));
+              if (missing.length) {
+                throw new Error(
+                  `校验失败：${release.tag_name} 仍缺少 ${missing.length} 个附件：${missing.slice(0, 5).map(a => a.name).join(", ")}`
+                );
+              }
+
+              // Publish only after every expected asset is present.
+              if (createdNow || targetRelease.draft) {
                 await github.rest.repos.updateRelease({
                   owner: myOwner,
                   repo: myRepo,
-                  release_id: targetId,
+                  release_id: targetRelease.id,
                   draft: false
                 });
                 console.log(`[发布完成] ${release.tag_name}，共 ${uploadedAssets.length} 个附件。`);
                 syncedTags.push(release.tag_name);
-              } catch (error) {
-                // Remove only the draft release created by this run. No partial
-                // public release is left behind, and the next run starts fresh.
-                try {
-                  await github.rest.repos.deleteRelease({
-                    owner: myOwner,
-                    repo: myRepo,
-                    release_id: targetId
-                  });
-                  console.log(`[清理] 已删除本次失败的草稿 Release（${release.tag_name}）。`);
-                } catch (cleanupError) {
-                  console.log(`[警告] 清理草稿 Release 失败：${cleanupError.message}`);
-                }
-                throw error;
+              } else if (existingAssets.length < release.assets.length) {
+                console.log(`[续传完成] ${release.tag_name}，已补齐至 ${uploadedAssets.length} 个附件。`);
+                syncedTags.push(release.tag_name);
+              } else {
+                console.log(`[跳过] ${release.tag_name} 已完整同步。`);
               }
             }
 
