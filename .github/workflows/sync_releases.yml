@@ -17,6 +17,9 @@ jobs:
       - name: Sync via GitHub API
         id: sync
         uses: actions/github-script@v7
+        env:
+          # Schedule uses the default branch; workflow_dispatch uses the selected branch.
+          SYNC_TARGET_BRANCH: ${{ github.ref_name }}
         with:
           github-token: ${{ secrets.SYNC_TOKEN }}
           script: |
@@ -24,7 +27,13 @@ jobs:
             const upstreamRepo = "sing-box";
             const myOwner = context.repo.owner;
             const myRepo = context.repo.repo;
+            const targetBranch = process.env.SYNC_TARGET_BRANCH;
             const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+            if (!targetBranch) {
+              throw new Error("无法确定目标分支，请检查 GitHub Actions 的 ref 配置。");
+            }
+            console.log(`目标仓库分支：${targetBranch}`);
 
             // Retry transient upstream asset download failures only.
             async function downloadWithRetry(asset, attempts = 6) {
@@ -99,7 +108,7 @@ jobs:
                 owner: myOwner,
                 repo: myRepo,
                 tag_name: release.tag_name,
-                target_commitish: release.target_commitish,
+                target_commitish: targetBranch,
                 name: release.name || release.tag_name,
                 body: release.body || "自动同步自上游仓库更新日志。",
                 draft: true,
