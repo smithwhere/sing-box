@@ -88,7 +88,7 @@ jobs:
             }
             const syncedTags = [];
             const skippedDraftTags = [];
-            const draftMarker = "<!-- managed-by-release-sync-v1 -->";
+            const syncMarker = "<!-- managed-by-release-sync-v1 -->";
 
             // Oldest first, so release order remains chronological.
             for (const release of upstreamReleases.data.reverse()) {
@@ -108,7 +108,7 @@ jobs:
               }
               let createdNow = false;
               // Never modify or publish a draft that was not created by this workflow.
-              if (targetRelease?.draft && !(targetRelease.body || "").includes(draftMarker)) {
+              if (targetRelease?.draft && !(targetRelease.body || "").includes(syncMarker)) {
                 skippedDraftTags.push(release.tag_name);
                 core.warning(`跳过手动创建的草稿 Release：${release.tag_name}`);
                 continue;
@@ -122,7 +122,7 @@ jobs:
                   tag_name: release.tag_name,
                   target_commitish: targetBranch,
                   name: release.name || release.tag_name,
-                  body: (release.body || "自动同步自上游仓库更新日志。") + "\n\n" + draftMarker,
+                  body: (release.body || "自动同步自上游仓库更新日志。") + "\n\n" + syncMarker,
                   draft: true,
                   prerelease: release.prerelease
                 });
@@ -227,12 +227,12 @@ jobs:
               }
 
               // Publish only after every expected asset is present.
+              // Keep the sync marker so the release build workflows can skip mirrors.
               if (createdNow || targetRelease.draft) {
                 await github.rest.repos.updateRelease({
                   owner: myOwner,
                   repo: myRepo,
                   release_id: targetRelease.id,
-                  body: (targetRelease.body || "").replace(draftMarker, "").trimEnd(),
                   draft: false
                 });
                 console.log(`[发布完成] ${release.tag_name}，共 ${uploadedAssets.length} 个附件。`);

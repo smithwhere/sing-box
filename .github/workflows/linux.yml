@@ -17,6 +17,7 @@ on:
 
 jobs:
   calculate_version:
+    if: github.event_name != 'release' || !contains(github.event.release.body, '<!-- managed-by-release-sync-v1 -->')
     name: Calculate version
     runs-on: ubuntu-latest
     outputs:
