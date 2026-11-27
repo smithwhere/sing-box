@@ -18,6 +18,7 @@ env:
 
 jobs:
   build_binary:
+    if: github.event_name != 'release' || !contains(github.event.release.body, '<!-- managed-by-release-sync-v1 -->')
     name: Build binary
     runs-on: ubuntu-latest
     strategy:
