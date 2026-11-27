@@ -1,9 +1,9 @@
 name: Pure API Sync Releases
 
 on:
-  schedule:
-    - cron: '0 0,12 * * *' # 每 12 小时自动检查
-  workflow_dispatch:      # 支持手动运行
+  push:
+    branches:
+      - codex/release-sync-smoke-pr-2
 
 concurrency:
   group: sync-releases
@@ -20,8 +20,8 @@ jobs:
         id: sync
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
-          # Schedule uses the default branch; workflow_dispatch uses the selected branch.
-          SYNC_TARGET_BRANCH: ${{ github.ref_name }}
+          # Smoke run uses the same Release target as the production schedule.
+          SYNC_TARGET_BRANCH: ${{ github.event.repository.default_branch }}
           SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
           RELEASE_TOKEN: ${{ github.token }}
         with:
